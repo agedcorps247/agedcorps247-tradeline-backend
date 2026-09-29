@@ -17,7 +17,7 @@ function decrypt(o){const d=crypto.createDecipheriv('aes-256-gcm',encKey(),Buffe
 let dbPromise;
 async function db(){if(!process.env.MONGODB_URI)throw new Error('MONGODB_URI is not configured');if(!dbPromise){const c=new MongoClient(process.env.MONGODB_URI);dbPromise=c.connect().then(()=>c.db(process.env.MONGODB_DB||'agedcorps247'));}return dbPromise;}
 function admin(req,res,next){const supplied=req.get('x-admin-key')||'';const expected=process.env.ADMIN_API_KEY||'';if(!expected||supplied.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(supplied),Buffer.from(expected)))return res.status(401).json({ok:false,error:'Unauthorized'});next();}
-app.get('/',(req,res)=>res.json({ok:true,service:'AgedCorps247 Tradeline Orders API',version:'5-secure'}));
+app.get('/',(req,res)=>res.json({ok:true,service:'AgedCorps247 Tradeline Orders API',version:'6-status-email'}));
 app.get('/health',async(req,res)=>{let database=false;try{await (await db()).command({ping:1});database=true}catch{}res.json({ok:true,database});});
 app.post('/api/tradeline-orders',async(req,res)=>{try{const {order,name,email,phone,sender,ref,items,total,screenshot}=req.body||{};if(!order||!name||!email||!phone||!Array.isArray(items)||!items.length||!Number.isFinite(Number(total)))return res.status(400).json({ok:false,error:'Missing required order information.'});
  const tk=token(order,email),formUrl=`${SITE}/tradeline-details.html?order=${encodeURIComponent(order)}&email=${encodeURIComponent(email)}&token=${tk}`,lines=items.map(x=>`<li>${esc(x.description)} — ${esc(x.id)} — $${Number(x.price).toLocaleString()}</li>`).join('');
@@ -32,5 +32,27 @@ app.post('/api/tradeline-order-details',async(req,res)=>{try{const {order,email,
  res.json({ok:true,order,status:'details_submitted'});setImmediate(async()=>{try{await sendEmail({to:process.env.ORDERS_EMAIL||FROM_EMAIL,subject:`Secure Order Details Submitted ${order}`,html:`<h2>Secure Order Details Submitted</h2><p><b>Order:</b> ${esc(order)}</p><p><b>Customer:</b> ${esc(name)}<br><b>Email:</b> ${esc(email)}<br><b>Phone:</b> ${esc(phone)}</p><p>SSN, DOB and address are encrypted in secure storage and are not included in this email.</p>`});}catch(e){console.error('DETAILS_EMAIL_FAILED',order,e.message)}});
 }catch(e){console.error('DETAILS_SUBMIT_FAILED',e.message);res.status(500).json({ok:false,error:'Unable to securely submit details.'})}});
 app.get('/api/admin/orders/:order',admin,async(req,res)=>{try{const D=await db(),o=await D.collection('orders').findOne({order:req.params.order});if(!o)return res.status(404).json({ok:false,error:'Order not found'});let sensitive=null;if(o.ssnEncrypted)sensitive={address:JSON.parse(decrypt(o.addressEncrypted)),dob:decrypt(o.dobEncrypted),ssn:decrypt(o.ssnEncrypted)};res.set('Cache-Control','no-store');res.json({ok:true,order:{order:o.order,name:o.name,email:o.email,phone:o.phone,items:o.items,total:o.total,status:o.status,createdAt:o.createdAt,detailsSubmittedAt:o.detailsSubmittedAt,...sensitive}})}catch(e){console.error('ADMIN_LOOKUP_FAILED',e.message);res.status(500).json({ok:false,error:'Unable to retrieve order'})}});
-app.patch('/api/admin/orders/:order/status',admin,async(req,res)=>{const allowed=['pending_payment','payment_confirmed','details_submitted','processing','completed','cancelled'];if(!allowed.includes(req.body?.status))return res.status(400).json({ok:false,error:'Invalid status'});const D=await db();await D.collection('orders').updateOne({order:req.params.order},{$set:{status:req.body.status,updatedAt:new Date()}});res.json({ok:true,status:req.body.status})});
-app.listen(process.env.PORT||3000,()=>console.log('AC247 secure orders backend v5 running'));
+function statusEmail(o,status){
+ const itemLines=(o.items||[]).map(x=>`<li>${esc(x.description||x.name||x.title||x.id||'Tradeline')} — ${esc(x.id||'')}</li>`).join('');
+ const base=`<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto;color:#101828"><div style="background:#0B1C2F;color:white;padding:22px"><b style="color:#DCAE55;font-size:20px">AGEDCORPS247</b></div><div style="padding:24px"><p>Order <b>${esc(o.order)}</b></p><ul>${itemLines}</ul>`;
+ const end=`<p style="color:#667085;font-size:13px">For your security, SSN, date of birth and other sensitive fulfillment information are never included in status emails.</p></div></div>`;
+ if(status==='payment_confirmed'){
+   const tk=token(o.order,o.email), formUrl=`${SITE}/tradeline-details.html?order=${encodeURIComponent(o.order)}&email=${encodeURIComponent(o.email)}&token=${tk}`;
+   const need=!o.detailsSubmittedAt;
+   return {subject:`Payment Confirmed — ${o.order}`,html:base+`<h2>Payment Confirmed</h2><p>Hi ${esc(o.name)}, we have confirmed receipt of your payment. Your tradeline reservation is now moving forward.</p>${need?`<p><a href="${formUrl}" style="display:inline-block;background:#DCAE55;color:#111;text-decoration:none;padding:13px 18px;border-radius:8px;font-weight:bold">COMPLETE SECURE ORDER FORM</a></p>`:'<p>Your secure order details are already on file.</p>'}`+end};
+ }
+ if(status==='processing')return {subject:`Order Processing — ${o.order}`,html:base+`<h2>Your Order Is Processing</h2><p>Hi ${esc(o.name)}, your AgedCorps247 tradeline order is now being processed.</p>`+end};
+ if(status==='completed')return {subject:`Order Completed — ${o.order}`,html:base+`<h2>Order Completed</h2><p>Hi ${esc(o.name)}, your AgedCorps247 tradeline order has been marked completed.</p>`+end};
+ if(status==='cancelled')return {subject:`Order Cancelled — ${o.order}`,html:base+`<h2>Order Cancelled</h2><p>Hi ${esc(o.name)}, order ${esc(o.order)} has been marked cancelled. If you have questions, reply to this email.</p>`+end};
+ return null;
+}
+app.patch('/api/admin/orders/:order/status',admin,async(req,res)=>{try{
+ const allowed=['pending_payment','payment_confirmed','details_submitted','processing','completed','cancelled'],status=req.body?.status;
+ if(!allowed.includes(status))return res.status(400).json({ok:false,error:'Invalid status'});
+ const D=await db(),o=await D.collection('orders').findOne({order:req.params.order});if(!o)return res.status(404).json({ok:false,error:'Order not found'});
+ let customerNotified=false,emailError=null;const mail=statusEmail(o,status);
+ if(mail){try{await sendEmail({to:o.email,subject:mail.subject,html:mail.html,replyTo:process.env.ORDERS_EMAIL||FROM_EMAIL});customerNotified=true;console.log('STATUS_EMAIL_SENT',o.order,status)}catch(e){emailError=e.message;console.error('STATUS_EMAIL_FAILED',o.order,status,e.message)}}
+ await D.collection('orders').updateOne({_id:o._id},{$set:{status,updatedAt:new Date(),lastStatusEmail:customerNotified?{status,sentAt:new Date()}:o.lastStatusEmail},$push:{statusHistory:{status,at:new Date(),customerNotified,emailError}}});
+ res.json({ok:true,status,customerNotified,emailError});
+}catch(e){console.error('STATUS_UPDATE_FAILED',req.params.order,e.message);res.status(500).json({ok:false,error:'Unable to update order status'})}});
+app.listen(process.env.PORT||3000,()=>console.log('AC247 secure orders backend v6 running'));
