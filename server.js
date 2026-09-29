@@ -1,62 +1,36 @@
 require('dotenv').config();
-const express=require('express'); const helmet=require('helmet'); const cors=require('cors'); const crypto=require('crypto');
+const express=require('express'); const helmet=require('helmet'); const cors=require('cors'); const crypto=require('crypto'); const {MongoClient}=require('mongodb');
 const app=express(); const SITE=(process.env.SITE_URL||'https://agedcorps247.com').replace(/\/$/,'');
-app.use(helmet());
-app.use(express.json({limit:'8mb'}));
-const allowedOrigins=new Set([SITE, SITE.replace('://','://www.')]);
-app.use(cors({origin:(origin,cb)=>{if(!origin||allowedOrigins.has(origin)) return cb(null,true); cb(new Error('Origin not allowed'));}}));
+app.use(helmet()); app.use(express.json({limit:'8mb'}));
+const allowedOrigins=new Set([SITE,SITE.replace('://','://www.')]);
+app.use(cors({origin:(origin,cb)=>{if(!origin||allowedOrigins.has(origin))return cb(null,true);cb(new Error('Origin not allowed'));}}));
 app.use((req,res,next)=>{console.log(new Date().toISOString(),req.method,req.path);next();});
-const RESEND_API='https://api.resend.com/emails';
-const FROM_EMAIL=process.env.FROM_EMAIL||'ordersupport@agedcorps247.com';
-const FROM_NAME=process.env.FROM_NAME||'AgedCorps247 Orders';
-async function sendEmail({to,subject,html,replyTo,attachments=[]}){
-  if(!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured');
-  const payload={from:`${FROM_NAME} <${FROM_EMAIL}>`,to:Array.isArray(to)?to:[to],subject,html};
-  if(replyTo) payload.reply_to=replyTo;
-  if(attachments.length) payload.attachments=attachments.map(a=>({filename:a.filename,content:a.content.toString('base64')}));
-  const r=await fetch(RESEND_API,{method:'POST',headers:{Authorization:`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(15000)});
-  const data=await r.json().catch(()=>({}));
-  if(!r.ok) throw new Error(`Resend ${r.status}: ${data.message||JSON.stringify(data)}`);
-  return data;
-}
+const RESEND_API='https://api.resend.com/emails', FROM_EMAIL=process.env.FROM_EMAIL||'ordersupport@agedcorps247.com', FROM_NAME=process.env.FROM_NAME||'AgedCorps247 Orders';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const secret=()=>process.env.ORDER_TOKEN_SECRET||'change-me';
-function token(order,email){return crypto.createHmac('sha256',secret()).update(order+'|'+email.toLowerCase()).digest('hex');}
-app.get('/',(req,res)=>res.json({ok:true,service:'AgedCorps247 Tradeline Orders API'}));
-app.get('/health',(req,res)=>res.json({ok:true}));
-app.post('/api/tradeline-orders',(req,res)=>{try{
-  const {order,name,email,phone,sender,ref,items,total,screenshot}=req.body||{};
-  if(!order||!name||!email||!phone||!Array.isArray(items)||!items.length||!Number.isFinite(Number(total))) {
-    return res.status(400).json({ok:false,error:'Missing required order information.'});
-  }
-  const tk=token(order,email);
-  const formUrl=`${SITE}/tradeline-details.html?order=${encodeURIComponent(order)}&email=${encodeURIComponent(email)}&token=${tk}`;
-  const lines=items.map(x=>`<li>${esc(x.description)} — ${esc(x.id)} — $${Number(x.price).toLocaleString()}</li>`).join('');
-  let attachments=[];
-  if(screenshot&&screenshot.data&&screenshot.name){
-    const m=String(screenshot.data).match(/^data:(image\/(?:png|jpeg)|application\/pdf);base64,(.+)$/);
-    if(m){const buf=Buffer.from(m[2],'base64'); if(buf.length<=5*1024*1024) attachments=[{filename:String(screenshot.name).replace(/[^a-zA-Z0-9._-]/g,'_'),content:buf,contentType:m[1]}];}
-  }
-
-  // Accept the reservation immediately. Email delivery is intentionally decoupled
-  // so a temporary SMTP outage never makes a valid reservation look unsuccessful.
-  res.status(202).json({ok:true,order,formUrl,status:'pending_payment',emailDelivery:'queued'});
-
-  setImmediate(async()=>{
-    try{
-      await sendEmail({to:process.env.ORDERS_EMAIL||'ordersupport@agedcorps247.com',replyTo:email,subject:`New Tradeline Reservation ${order} — Pending Payment`,html:`<h2>New Tradeline Reservation</h2><p><b>Order:</b> ${esc(order)}</p><p><b>Customer:</b> ${esc(name)}<br><b>Email:</b> ${esc(email)}<br><b>Phone:</b> ${esc(phone)}<br><b>Zelle sender:</b> ${esc(sender||'Not provided')}<br><b>Reference:</b> ${esc(ref||'Not provided')}</p><ul>${lines}</ul><p><b>Total:</b> $${Number(total).toLocaleString()}</p><p>Status: Pending Payment</p>${attachments.length?'<p><b>Zelle screenshot attached.</b></p>':'<p>No Zelle screenshot uploaded. Customer may email it separately using the order number.</p>'}`,attachments});
-      console.log(new Date().toISOString(),'ORDER_EMAIL_SENT',order);
-    }catch(e){console.error(new Date().toISOString(),'ORDER_EMAIL_FAILED',order,e.code||'',e.message||e);}
-
-    try{
-      await sendEmail({to:email,subject:`AgedCorps247 Reservation ${order} — Pending Payment`,html:`<div style="font-family:Arial;max-width:640px;margin:auto"><h1 style="color:#0B1C2F">Reservation Received</h1><p>Hi ${esc(name)}, we received your tradeline reservation <b>${esc(order)}</b>.</p><p><b>Order Status: Pending Payment</b></p><ul>${lines}</ul><p><b>Total: $${Number(total).toLocaleString()}</b></p><p>Send the exact total by Zelle to <b>zelle@agedcorps247.com</b><br>Recipient: <b>Good Fellas Holdings DBA AgedCorps247.com</b>.</p><p>Your order will begin processing once your payment has been received and confirmed. Please complete your order form so the required fulfillment information is on file.</p><p><a href="${formUrl}" style="background:#D9AC5C;color:#0B1C2F;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:bold">COMPLETE ORDER FORM</a></p><p style="font-size:12px;color:#666">Do not send your SSN or DOB by email.</p></div>`});
-      console.log(new Date().toISOString(),'CUSTOMER_EMAIL_SENT',order);
-    }catch(e){console.error(new Date().toISOString(),'CUSTOMER_EMAIL_FAILED',order,e.code||'',e.message||e);}
-  });
-}catch(e){console.error(e); if(!res.headersSent) res.status(500).json({ok:false,error:'Unable to create reservation.'});}
-});
-// Sensitive fulfillment endpoint: does not email SSN/DOB. Replace encrypted persistence with your approved secure datastore before production.
-app.post('/api/tradeline-order-details',async(req,res)=>{try{const {order,email,token:tk,name,address,dob,ssn,phone}=req.body||{}; if(!order||!email||!tk||!name||!address||!dob||!ssn||!phone) return res.status(400).json({ok:false,error:'All fields are required.'}); const good=crypto.timingSafeEqual(Buffer.from(tk),Buffer.from(token(order,email))); if(!good)return res.status(403).json({ok:false,error:'Invalid order link.'});
-// Intentionally do not log, email, or write SSN/DOB to disk in this starter backend.
-await sendEmail({to:process.env.ORDERS_EMAIL||'ordersupport@agedcorps247.com',subject:`Order Form Submitted ${order}`,html:`<h2>Order Form Submitted</h2><p><b>Order:</b> ${esc(order)}</p><p><b>Customer:</b> ${esc(name)}<br><b>Email:</b> ${esc(email)}<br><b>Phone:</b> ${esc(phone)}</p><p>Sensitive identity fields were submitted through the secure form and were not included in this email.</p><p><b>Important:</b> This starter backend does not persist SSN/DOB. Connect an encrypted restricted-access datastore before using this endpoint for live fulfillment.</p>`}); res.json({ok:true});}catch(e){console.error(e);res.status(500).json({ok:false,error:'Unable to submit details.'})}});
-app.listen(process.env.PORT||3000,()=>console.log('AC247 orders backend running'));
+async function sendEmail({to,subject,html,replyTo,attachments=[]}){if(!process.env.RESEND_API_KEY)throw new Error('RESEND_API_KEY is not configured');const p={from:`${FROM_NAME} <${FROM_EMAIL}>`,to:Array.isArray(to)?to:[to],subject,html};if(replyTo)p.reply_to=replyTo;if(attachments.length)p.attachments=attachments.map(a=>({filename:a.filename,content:a.content.toString('base64')}));const r=await fetch(RESEND_API,{method:'POST',headers:{Authorization:`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify(p),signal:AbortSignal.timeout(15000)});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(`Resend ${r.status}: ${d.message||JSON.stringify(d)}`);return d;}
+const orderSecret=()=>process.env.ORDER_TOKEN_SECRET||'';
+function token(order,email){return crypto.createHmac('sha256',orderSecret()).update(order+'|'+email.toLowerCase()).digest('hex');}
+function safeTokenEqual(a,b){try{const A=Buffer.from(String(a),'hex'),B=Buffer.from(String(b),'hex');return A.length===B.length&&A.length>0&&crypto.timingSafeEqual(A,B)}catch{return false}}
+function encKey(){const k=Buffer.from(process.env.DATA_ENCRYPTION_KEY||'','base64');if(k.length!==32)throw new Error('DATA_ENCRYPTION_KEY must be a base64-encoded 32-byte key');return k;}
+function encrypt(value){const iv=crypto.randomBytes(12),c=crypto.createCipheriv('aes-256-gcm',encKey(),iv);const ct=Buffer.concat([c.update(String(value),'utf8'),c.final()]);return {v:1,iv:iv.toString('base64'),tag:c.getAuthTag().toString('base64'),ct:ct.toString('base64')}}
+function decrypt(o){const d=crypto.createDecipheriv('aes-256-gcm',encKey(),Buffer.from(o.iv,'base64'));d.setAuthTag(Buffer.from(o.tag,'base64'));return Buffer.concat([d.update(Buffer.from(o.ct,'base64')),d.final()]).toString('utf8')}
+let dbPromise;
+async function db(){if(!process.env.MONGODB_URI)throw new Error('MONGODB_URI is not configured');if(!dbPromise){const c=new MongoClient(process.env.MONGODB_URI);dbPromise=c.connect().then(()=>c.db(process.env.MONGODB_DB||'agedcorps247'));}return dbPromise;}
+function admin(req,res,next){const supplied=req.get('x-admin-key')||'';const expected=process.env.ADMIN_API_KEY||'';if(!expected||supplied.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(supplied),Buffer.from(expected)))return res.status(401).json({ok:false,error:'Unauthorized'});next();}
+app.get('/',(req,res)=>res.json({ok:true,service:'AgedCorps247 Tradeline Orders API',version:'5-secure'}));
+app.get('/health',async(req,res)=>{let database=false;try{await (await db()).command({ping:1});database=true}catch{}res.json({ok:true,database});});
+app.post('/api/tradeline-orders',async(req,res)=>{try{const {order,name,email,phone,sender,ref,items,total,screenshot}=req.body||{};if(!order||!name||!email||!phone||!Array.isArray(items)||!items.length||!Number.isFinite(Number(total)))return res.status(400).json({ok:false,error:'Missing required order information.'});
+ const tk=token(order,email),formUrl=`${SITE}/tradeline-details.html?order=${encodeURIComponent(order)}&email=${encodeURIComponent(email)}&token=${tk}`,lines=items.map(x=>`<li>${esc(x.description)} — ${esc(x.id)} — $${Number(x.price).toLocaleString()}</li>`).join('');
+ try{const D=await db();await D.collection('orders').updateOne({order},{$setOnInsert:{order,name,email:email.toLowerCase(),phone,sender:sender||'',ref:ref||'',items,total:Number(total),status:'pending_payment',createdAt:new Date()},$set:{updatedAt:new Date()}},{upsert:true});}catch(e){console.error('ORDER_DB_FAILED',order,e.message);return res.status(503).json({ok:false,error:'Secure order storage is temporarily unavailable.'});}
+ let attachments=[];if(screenshot&&screenshot.data&&screenshot.name){const m=String(screenshot.data).match(/^data:(image\/(?:png|jpeg)|application\/pdf);base64,(.+)$/);if(m){const buf=Buffer.from(m[2],'base64');if(buf.length<=5*1024*1024)attachments=[{filename:String(screenshot.name).replace(/[^a-zA-Z0-9._-]/g,'_'),content:buf}]}}
+ res.status(202).json({ok:true,order,formUrl,status:'pending_payment',emailDelivery:'queued'});
+ setImmediate(async()=>{try{await sendEmail({to:process.env.ORDERS_EMAIL||FROM_EMAIL,replyTo:email,subject:`New Tradeline Reservation ${order} — Pending Payment`,html:`<h2>New Tradeline Reservation</h2><p><b>Order:</b> ${esc(order)}</p><p><b>Customer:</b> ${esc(name)}<br><b>Email:</b> ${esc(email)}<br><b>Phone:</b> ${esc(phone)}</p><ul>${lines}</ul><p><b>Total:</b> $${Number(total).toLocaleString()}</p><p>Status: Pending Payment</p>`,attachments});console.log('ORDER_EMAIL_SENT',order)}catch(e){console.error('ORDER_EMAIL_FAILED',order,e.message)}try{await sendEmail({to:email,subject:`AgedCorps247 Reservation ${order} — Pending Payment`,html:`<div style="font-family:Arial;max-width:640px;margin:auto"><h1>Reservation Received</h1><p>Hi ${esc(name)}, your order is <b>${esc(order)}</b>.</p><p><b>Status: Pending Payment</b></p><ul>${lines}</ul><p><b>Total: $${Number(total).toLocaleString()}</b></p><p>Zelle: <b>zelle@agedcorps247.com</b><br>Recipient: Good Fellas Holdings DBA AgedCorps247.com</p><p><a href="${formUrl}">COMPLETE SECURE ORDER FORM</a></p><p>Do not send SSN or DOB by email.</p></div>`});console.log('CUSTOMER_EMAIL_SENT',order)}catch(e){console.error('CUSTOMER_EMAIL_FAILED',order,e.message)}});
+}catch(e){console.error(e);if(!res.headersSent)res.status(500).json({ok:false,error:'Unable to create reservation.'})}});
+app.post('/api/tradeline-order-details',async(req,res)=>{try{const {order,email,token:tk,name,street,city,state,zip,dob,ssn,phone}=req.body||{};if(!order||!email||!tk||!name||!street||!city||!state||!zip||!dob||!ssn||!phone)return res.status(400).json({ok:false,error:'All fields are required.'});if(!safeTokenEqual(tk,token(order,email)))return res.status(403).json({ok:false,error:'Invalid or expired order link.'});
+ const D=await db(),existing=await D.collection('orders').findOne({order,email:email.toLowerCase()});if(!existing)return res.status(404).json({ok:false,error:'Order not found.'});
+ await D.collection('orders').updateOne({_id:existing._id},{$set:{name,phone,addressEncrypted:encrypt(JSON.stringify({street,city,state,zip})),dobEncrypted:encrypt(dob),ssnEncrypted:encrypt(ssn.replace(/\D/g,'')),status:'details_submitted',detailsSubmittedAt:new Date(),updatedAt:new Date()}});
+ res.json({ok:true,order,status:'details_submitted'});setImmediate(async()=>{try{await sendEmail({to:process.env.ORDERS_EMAIL||FROM_EMAIL,subject:`Secure Order Details Submitted ${order}`,html:`<h2>Secure Order Details Submitted</h2><p><b>Order:</b> ${esc(order)}</p><p><b>Customer:</b> ${esc(name)}<br><b>Email:</b> ${esc(email)}<br><b>Phone:</b> ${esc(phone)}</p><p>SSN, DOB and address are encrypted in secure storage and are not included in this email.</p>`});}catch(e){console.error('DETAILS_EMAIL_FAILED',order,e.message)}});
+}catch(e){console.error('DETAILS_SUBMIT_FAILED',e.message);res.status(500).json({ok:false,error:'Unable to securely submit details.'})}});
+app.get('/api/admin/orders/:order',admin,async(req,res)=>{try{const D=await db(),o=await D.collection('orders').findOne({order:req.params.order});if(!o)return res.status(404).json({ok:false,error:'Order not found'});let sensitive=null;if(o.ssnEncrypted)sensitive={address:JSON.parse(decrypt(o.addressEncrypted)),dob:decrypt(o.dobEncrypted),ssn:decrypt(o.ssnEncrypted)};res.set('Cache-Control','no-store');res.json({ok:true,order:{order:o.order,name:o.name,email:o.email,phone:o.phone,items:o.items,total:o.total,status:o.status,createdAt:o.createdAt,detailsSubmittedAt:o.detailsSubmittedAt,...sensitive}})}catch(e){console.error('ADMIN_LOOKUP_FAILED',e.message);res.status(500).json({ok:false,error:'Unable to retrieve order'})}});
+app.patch('/api/admin/orders/:order/status',admin,async(req,res)=>{const allowed=['pending_payment','payment_confirmed','details_submitted','processing','completed','cancelled'];if(!allowed.includes(req.body?.status))return res.status(400).json({ok:false,error:'Invalid status'});const D=await db();await D.collection('orders').updateOne({order:req.params.order},{$set:{status:req.body.status,updatedAt:new Date()}});res.json({ok:true,status:req.body.status})});
+app.listen(process.env.PORT||3000,()=>console.log('AC247 secure orders backend v5 running'));
