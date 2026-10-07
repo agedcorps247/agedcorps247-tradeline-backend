@@ -21,6 +21,28 @@ async function db(){if(!process.env.MONGODB_URI)throw new Error('MONGODB_URI is 
 function admin(req,res,next){const supplied=req.get('x-admin-key')||'';const expected=process.env.ADMIN_API_KEY||'';if(!expected||supplied.length!==expected.length||!crypto.timingSafeEqual(Buffer.from(supplied),Buffer.from(expected)))return res.status(401).json({ok:false,error:'Unauthorized'});next();}
 app.get('/',(req,res)=>res.json({ok:true,service:'AgedCorps247 Tradeline Orders API',version:'6-status-email'}));
 app.get('/health',async(req,res)=>{let database=false;try{await (await db()).command({ping:1});database=true}catch{}res.json({ok:true,database});});
+
+// Inventory access lead gate: require contact info and save before inventory unlocks.
+app.post('/api/inventory-leads',async(req,res)=>{try{
+ const name=String(req.body?.name||'').trim();
+ const email=String(req.body?.email||'').trim().toLowerCase();
+ const phone=String(req.body?.phone||'').trim();
+ const phoneDigits=phone.replace(/\D/g,'');
+ const source=String(req.body?.source||'AU Tradelines Inventory').trim().slice(0,100);
+ if(name.length<2)return res.status(400).json({ok:false,error:'Please enter your full name.'});
+ if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({ok:false,error:'Please enter a valid email address.'});
+ if(phoneDigits.length<10||phoneDigits.length>15)return res.status(400).json({ok:false,error:'Please enter a valid phone number.'});
+ const D=await db();
+ const now=new Date();
+ const existing=await D.collection('inventoryLeads').findOne({$or:[{email},{phoneDigits}]});
+ if(existing){
+   await D.collection('inventoryLeads').updateOne({_id:existing._id},{$set:{name,email,phone,phoneDigits,source,lastAccessAt:now,updatedAt:now},$inc:{accessCount:1}});
+ }else{
+   await D.collection('inventoryLeads').insertOne({name,email,phone,phoneDigits,source,status:'new',createdAt:now,updatedAt:now,lastAccessAt:now,accessCount:1});
+ }
+ res.set('Cache-Control','no-store');
+ res.json({ok:true,message:'Access saved.'});
+}catch(e){console.error('INVENTORY_LEAD_FAILED',e.message);res.status(503).json({ok:false,error:'Unable to save your information right now. Please try again.'})}});
 app.post('/api/tradeline-orders',async(req,res)=>{try{const {order,name,email,phone,sender,ref,items,total,screenshot}=req.body||{};if(!order||!name||!email||!phone||!Array.isArray(items)||!items.length||!Number.isFinite(Number(total)))return res.status(400).json({ok:false,error:'Missing required order information.'});
  const tk=token(order,email),formUrl=`${SITE}/tradeline-details.html?order=${encodeURIComponent(order)}&email=${encodeURIComponent(email)}&token=${tk}`,lines=items.map(x=>`<li>${esc(x.description)} — ${esc(x.id)} — $${Number(x.price).toLocaleString()}</li>`).join('');
  try{const D=await db();await D.collection('orders').updateOne({order},{$setOnInsert:{order,name,email:email.toLowerCase(),phone,sender:sender||'',ref:ref||'',items,total:Number(total),status:'pending_payment',createdAt:new Date()},$set:{updatedAt:new Date()}},{upsert:true});}catch(e){console.error('ORDER_DB_FAILED',order,e.message);return res.status(503).json({ok:false,error:'Secure order storage is temporarily unavailable.'});}
